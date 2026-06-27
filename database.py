@@ -1,4 +1,4 @@
-# database.py
+# database.py (enhanced)
 import sqlite3
 import secrets
 import string
@@ -7,10 +7,10 @@ import os
 import zipfile
 from datetime import datetime, timedelta
 import threading
+import bcrypt
 
 DB_LOCK = threading.Lock()
 DATABASE = 'discord_bot.db'
-BACKUP_DIR = 'backups'
 
 def generate_license_key(length=24):
     alphabet = string.ascii_uppercase + string.digits
@@ -21,16 +21,9 @@ def generate_license_key(length=24):
     return '-'.join(segments)
 
 def init_db():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS admins (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            discord_id TEXT UNIQUE NOT NULL
-        )''')
         
         c.execute('''CREATE TABLE IF NOT EXISTS licenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,22 +34,26 @@ def init_db():
             expires_at TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1,
             created_by TEXT NOT NULL,
-            notes TEXT DEFAULT ''
+            notes TEXT DEFAULT '',
+            auto_responder_enabled INTEGER NOT NULL DEFAULT 0,
+            max_auto_responders INTEGER NOT NULL DEFAULT 1
         )''')
         
         c.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            discord_id TEXT NOT NULL,
+            discord_id TEXT,
             license_key TEXT NOT NULL,
             discord_token TEXT NOT NULL,
+            password_hash TEXT,
             created_at TEXT NOT NULL,
             last_login TEXT,
+            max_accounts INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY (license_key) REFERENCES licenses(key)
         )''')
         
         c.execute('''CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_discord_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
             job_name TEXT NOT NULL,
             channel_ids TEXT NOT NULL,
             message_content TEXT NOT NULL,
@@ -64,15 +61,32 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'running',
             total_sent INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
-            last_run TEXT
+            last_run TEXT,
+            token_used TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS auto_responders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            trigger_keyword TEXT DEFAULT '',
+            response_message TEXT NOT NULL,
+            reply_to_new_dms INTEGER NOT NULL DEFAULT 1,
+            reply_to_mentions INTEGER NOT NULL DEFAULT 0,
+            cooldown_seconds INTEGER NOT NULL DEFAULT 60,
+            status TEXT NOT NULL DEFAULT 'active',
+            total_replies INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
         )''')
         
         conn.commit()
         conn.close()
 
 # ===== License Operations =====
-
-def create_licenses(num_keys, max_accounts, days_valid, admin_discord_id, notes=""):
+def create_licenses(num_keys, max_accounts, days_valid, admin_username, notes="", 
+                    auto_responder_enabled=False, max_auto_responders=1):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
@@ -83,9 +97,13 @@ def create_licenses(num_keys, max_accounts, days_valid, admin_discord_id, notes=
             created_at = datetime.now().isoformat()
             expires_at = (datetime.now() + timedelta(days=days_valid)).isoformat()
             
-            c.execute('''INSERT INTO licenses (key, max_accounts, days_valid, created_at, expires_at, active, created_by, notes)
-                         VALUES (?, ?, ?, ?, ?, 1, ?, ?)''',
-                      (key, max_accounts, days_valid, created_at, expires_at, admin_discord_id, notes))
+            c.execute('''INSERT INTO licenses (key, max_accounts, days_valid, created_at, 
+                         expires_at, active, created_by, notes, auto_responder_enabled, 
+                         max_auto_responders)
+                         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)''',
+                      (key, max_accounts, days_valid, created_at, expires_at, 
+                       admin_username, notes, 1 if auto_responder_enabled else 0, 
+                       max_auto_responders))
             keys.append(key)
         
         conn.commit()
@@ -109,23 +127,28 @@ def validate_license(key):
         
         return True, lic
 
-def get_license_account_count(key):
+def get_license_by_key(key):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users WHERE license_key=?", (key,))
-        count = c.fetchone()[0]
+        c.execute("SELECT * FROM licenses WHERE key=?", (key,))
+        lic = c.fetchone()
         conn.close()
-        return count
+        return lic
 
-# ===== License Editing Functions =====
+def get_all_licenses():
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM licenses ORDER BY created_at DESC")
+        licenses = c.fetchall()
+        conn.close()
+        return licenses
 
 def update_license_days(key, additional_days):
-    """Add extra days to a license"""
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        
         c.execute("SELECT * FROM licenses WHERE key=?", (key,))
         lic = c.fetchone()
         if not lic:
@@ -146,148 +169,137 @@ def update_license_days(key, additional_days):
                   (new_expiry.isoformat(), new_days_valid, key))
         conn.commit()
         conn.close()
-        
-        return True, f"License extended by {additional_days} days. New expiry: {new_expiry.strftime('%Y-%m-%d')}"
+        return True, f"Extended by {additional_days} days"
 
 def update_license_accounts(key, new_max_accounts):
-    """Change max accounts for a license"""
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        
-        c.execute("SELECT * FROM licenses WHERE key=?", (key,))
-        lic = c.fetchone()
+        lic = get_license_by_key(key)
         if not lic:
             conn.close()
             return False, "License not found"
-        
-        current_count = get_license_account_count(key)
-        if new_max_accounts < current_count:
+        if new_max_accounts < 1:
             conn.close()
-            return False, f"Cannot reduce to {new_max_accounts} — there are already {current_count} accounts registered"
-        
+            return False, "Must be at least 1"
         c.execute("UPDATE licenses SET max_accounts=? WHERE key=?", (new_max_accounts, key))
         conn.commit()
         conn.close()
-        
-        return True, f"Max accounts updated from {lic[2]} to {new_max_accounts}"
+        return True, f"Max accounts updated to {new_max_accounts}"
 
-def set_license_expiry_date(key, new_expiry_date_str):
-    """Set a specific expiry date (YYYY-MM-DD format)"""
+def deactivate_license(key):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        
-        c.execute("SELECT * FROM licenses WHERE key=?", (key,))
-        lic = c.fetchone()
-        if not lic:
-            conn.close()
-            return False, "License not found"
-        
-        try:
-            new_date = datetime.strptime(new_expiry_date_str, '%Y-%m-%d')
-            new_expiry = new_date.replace(hour=23, minute=59, second=59)
-        except ValueError:
-            conn.close()
-            return False, "Invalid date format. Use YYYY-MM-DD"
-        
-        days_left = (new_expiry - datetime.now()).days
-        if days_left < 0:
-            days_left = 0
-        
-        c.execute("UPDATE licenses SET expires_at=?, days_valid=? WHERE key=?",
-                  (new_expiry.isoformat(), max(1, days_left), key))
+        c.execute("UPDATE licenses SET active=0 WHERE key=?", (key,))
         conn.commit()
         conn.close()
-        
-        return True, f"Expiry set to {new_expiry_date_str} ({max(1, days_left)} days from now)"
 
-def toggle_license_active(key, active_state):
-    """Activate or deactivate a license"""
+def activate_license(key):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        c.execute("UPDATE licenses SET active=? WHERE key=?", (1 if active_state else 0, key))
+        c.execute("UPDATE licenses SET active=1 WHERE key=?", (key,))
         conn.commit()
         conn.close()
-        
-        state = "activated" if active_state else "deactivated"
-        return True, f"License {state}"
 
 # ===== User Operations =====
-
-def register_or_login(discord_id, license_key, discord_token):
+def register_user(license_key, discord_token, password=None):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
         
-        c.execute("SELECT * FROM users WHERE discord_id=? AND discord_token=?", (discord_id, discord_token))
-        user = c.fetchone()
-        
-        if user:
-            c.execute("UPDATE users SET last_login=? WHERE id=?", 
-                      (datetime.now().isoformat(), user[0]))
-            conn.commit()
+        # Validate license
+        valid, lic = validate_license(license_key)
+        if not valid:
             conn.close()
-            return True, "Logged in successfully"
+            return False, lic
         
-        c.execute("SELECT * FROM users WHERE discord_id=?", (discord_id,))
+        # Check account limit
+        c.execute("SELECT COUNT(*) FROM users WHERE license_key=?", (license_key,))
+        count = c.fetchone()[0]
+        if count >= lic[2]:
+            conn.close()
+            return False, f"License max accounts reached ({lic[2]})"
+        
+        # Check if token already registered
+        c.execute("SELECT * FROM users WHERE discord_token=?", (discord_token,))
         existing = c.fetchone()
         if existing:
             conn.close()
-            return False, "You already have a registered account with a different token"
+            return False, "This Discord token is already registered"
         
-        c.execute('''INSERT INTO users (discord_id, license_key, discord_token, created_at, last_login)
-                     VALUES (?, ?, ?, ?, ?)''',
-                  (discord_id, license_key, discord_token, datetime.now().isoformat(), datetime.now().isoformat()))
+        # Hash password if provided
+        password_hash = None
+        if password:
+            password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+        
+        c.execute('''INSERT INTO users (discord_id, license_key, discord_token, password_hash, 
+                     created_at, last_login, max_accounts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                  (None, license_key, discord_token, password_hash, 
+                   datetime.now().isoformat(), datetime.now().isoformat(), lic[2]))
+        
+        user_id = c.lastrowid
         conn.commit()
         conn.close()
-        return True, "Account created and logged in"
+        return True, {"user_id": user_id, "message": "Account created"}
 
-def get_user(discord_id):
+def get_user_by_id(user_id):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE discord_id=?", (discord_id,))
+        c.execute("SELECT * FROM users WHERE id=?", (user_id,))
         user = c.fetchone()
         conn.close()
         return user
 
-def get_license_info_for_user(discord_id):
+def get_user_tokens(user_id):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        c.execute('''SELECT l.key, l.max_accounts, l.days_valid, l.created_at, l.expires_at, l.active, l.notes
-                     FROM licenses l
-                     JOIN users u ON u.license_key = l.key
-                     WHERE u.discord_id=?''', (discord_id,))
-        lic = c.fetchone()
+        c.execute("SELECT id, discord_token FROM users WHERE id=?", (user_id,))
+        user = c.fetchone()
         conn.close()
-        return lic
+        if user:
+            return [{"id": user[0], "token": user[2][:15] + "..." + user[2][-4:], "full_token": user[2]}]
+        return []
+
+def get_all_users():
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute('''SELECT u.id, u.discord_id, u.license_key, u.discord_token, u.created_at,
+                            l.expires_at, l.max_accounts, l.active
+                     FROM users u
+                     JOIN licenses l ON u.license_key = l.key
+                     ORDER BY u.created_at DESC''')
+        users = c.fetchall()
+        conn.close()
+        return users
 
 # ===== Job Operations =====
-
-def create_job(discord_id, job_name, channel_ids_str, message_content, interval_seconds):
+def create_job(user_id, job_name, channel_ids_str, message_content, interval_seconds, token_used=None):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
         
-        c.execute('''INSERT INTO jobs (user_discord_id, job_name, channel_ids, message_content, 
-                     interval_seconds, status, total_sent, created_at)
-                     VALUES (?, ?, ?, ?, ?, 'running', 0, ?)''',
-                  (discord_id, job_name, channel_ids_str, message_content, 
-                   interval_seconds, datetime.now().isoformat()))
+        c.execute('''INSERT INTO jobs (user_id, job_name, channel_ids, message_content, 
+                     interval_seconds, status, total_sent, created_at, token_used)
+                     VALUES (?, ?, ?, ?, ?, 'running', 0, ?, ?)''',
+                  (user_id, job_name, channel_ids_str, message_content, 
+                   interval_seconds, datetime.now().isoformat(), token_used))
         
         job_id = c.lastrowid
         conn.commit()
         conn.close()
         return job_id
 
-def get_user_jobs(discord_id):
+def get_user_jobs(user_id):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        c.execute("SELECT * FROM jobs WHERE user_discord_id=? ORDER BY created_at DESC", (discord_id,))
+        c.execute("SELECT * FROM jobs WHERE user_id=? ORDER BY created_at DESC", (user_id,))
         jobs = c.fetchall()
         conn.close()
         return jobs
@@ -300,6 +312,16 @@ def get_job(job_id):
         job = c.fetchone()
         conn.close()
         return job
+
+def update_job(job_id, user_id, job_name, channel_ids, message_content, interval_seconds):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute('''UPDATE jobs SET job_name=?, channel_ids=?, message_content=?, 
+                     interval_seconds=? WHERE id=? AND user_id=?''',
+                  (job_name, channel_ids, message_content, interval_seconds, job_id, user_id))
+        conn.commit()
+        conn.close()
 
 def update_job_status(job_id, status):
     with DB_LOCK:
@@ -318,11 +340,11 @@ def increment_job_sent(job_id, count):
         conn.commit()
         conn.close()
 
-def delete_job(job_id, discord_id):
+def delete_job(job_id, user_id):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        c.execute("DELETE FROM jobs WHERE id=? AND user_discord_id=?", (job_id, discord_id))
+        c.execute("DELETE FROM jobs WHERE id=? AND user_id=?", (job_id, user_id))
         conn.commit()
         conn.close()
 
@@ -335,306 +357,182 @@ def get_all_running_jobs():
         conn.close()
         return jobs
 
-# ===== Admin Operations =====
-
-def is_admin(discord_id):
+# ===== Auto Responder Operations =====
+def create_auto_responder(user_id, name, response_message, trigger_keyword="",
+                          reply_to_new_dms=True, reply_to_mentions=False, cooldown_seconds=60):
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
-        c.execute("SELECT * FROM admins WHERE discord_id=?", (discord_id,))
-        admin = c.fetchone()
-        conn.close()
-        return admin is not None
-
-def add_admin(discord_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO admins (discord_id) VALUES (?)", (discord_id,))
-        conn.commit()
-        conn.close()
-
-def get_all_licenses():
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM licenses ORDER BY created_at DESC")
-        licenses = c.fetchall()
-        conn.close()
-        return licenses
-
-def get_license_by_key(key):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM licenses WHERE key=?", (key,))
-        lic = c.fetchone()
-        conn.close()
-        return lic
-
-def get_all_users():
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute('''SELECT u.id, u.discord_id, u.license_key, u.discord_token, u.created_at,
-                            l.expires_at, l.max_accounts, l.active
-                     FROM users u
-                     JOIN licenses l ON u.license_key = l.key
-                     ORDER BY u.created_at DESC''')
-        users = c.fetchall()
-        conn.close()
-        return users
-
-def deactivate_license(key):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("UPDATE licenses SET active=0 WHERE key=?", (key,))
-        conn.commit()
-        conn.close()
-
-def delete_license_complete(key):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute('''SELECT discord_id FROM users WHERE license_key=?''', (key,))
-        user_ids = [row[0] for row in c.fetchall()]
-        for uid in user_ids:
-            c.execute("UPDATE jobs SET status='deleted' WHERE user_discord_id=?", (uid,))
         
-        c.execute("DELETE FROM jobs WHERE user_discord_id IN (SELECT discord_id FROM users WHERE license_key=?)", (key,))
-        c.execute("DELETE FROM users WHERE license_key=?", (key,))
-        c.execute("DELETE FROM licenses WHERE key=?", (key,))
+        # Check if user's license allows auto-responders
+        c.execute('''SELECT l.auto_responder_enabled, l.max_auto_responders 
+                     FROM licenses l JOIN users u ON u.license_key = l.key 
+                     WHERE u.id=?''', (user_id,))
+        lic_info = c.fetchone()
+        
+        if not lic_info or not lic_info[0]:
+            conn.close()
+            return False, "Your license does not support auto-responders"
+        
+        # Check max auto-responders
+        c.execute("SELECT COUNT(*) FROM auto_responders WHERE user_id=?", (user_id,))
+        count = c.fetchone()[0]
+        if count >= lic_info[1]:
+            conn.close()
+            return False, f"Max auto-responders reached ({lic_info[1]})"
+        
+        c.execute('''INSERT INTO auto_responders (user_id, name, trigger_keyword, response_message,
+                     reply_to_new_dms, reply_to_mentions, cooldown_seconds, status, total_replies, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', 0, ?)''',
+                  (user_id, name, trigger_keyword, response_message,
+                   1 if reply_to_new_dms else 0, 1 if reply_to_mentions else 0, 
+                   cooldown_seconds, datetime.now().isoformat()))
+        
+        responder_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return True, {"responder_id": responder_id}
+
+def get_user_auto_responders(user_id):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM auto_responders WHERE user_id=? ORDER BY created_at DESC", (user_id,))
+        responders = c.fetchall()
+        conn.close()
+        return responders
+
+def get_auto_responder(responder_id):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM auto_responders WHERE id=?", (responder_id,))
+        responder = c.fetchone()
+        conn.close()
+        return responder
+
+def update_auto_responder(responder_id, user_id, name, response_message, trigger_keyword,
+                          reply_to_new_dms, reply_to_mentions, cooldown_seconds):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute('''UPDATE auto_responders SET name=?, trigger_keyword=?, response_message=?,
+                     reply_to_new_dms=?, reply_to_mentions=?, cooldown_seconds=?
+                     WHERE id=? AND user_id=?''',
+                  (name, trigger_keyword, response_message, 
+                   1 if reply_to_new_dms else 0, 1 if reply_to_mentions else 0,
+                   cooldown_seconds, responder_id, user_id))
         conn.commit()
         conn.close()
 
-# ===================================================================
-# BACKUP & RESTORE SYSTEM
-# ===================================================================
+def update_auto_responder_status(responder_id, status):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("UPDATE auto_responders SET status=? WHERE id=?", (status, responder_id))
+        conn.commit()
+        conn.close()
 
+def increment_responder_replies(responder_id):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("UPDATE auto_responders SET total_replies = total_replies + 1 WHERE id=?", (responder_id,))
+        conn.commit()
+        conn.close()
+
+def delete_auto_responder(responder_id, user_id):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("DELETE FROM auto_responders WHERE id=? AND user_id=?", (responder_id, user_id))
+        conn.commit()
+        conn.close()
+
+# ===== Backup =====
 def export_full_backup():
-    """Export entire database to a JSON backup data structure"""
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
         
-        backup_data = {
-            'version': '1.0',
-            'exported_at': datetime.now().isoformat(),
-            'data': {}
-        }
+        backup_data = {'version': '2.0', 'exported_at': datetime.now().isoformat(), 'data': {}}
         
-        # Export admins
-        c.execute("SELECT * FROM admins")
-        backup_data['data']['admins'] = [
-            {'discord_id': row[1]} for row in c.fetchall()
-        ]
-        
-        # Export licenses
         c.execute("SELECT * FROM licenses")
         backup_data['data']['licenses'] = [
-            {
-                'key': row[1],
-                'max_accounts': row[2],
-                'days_valid': row[3],
-                'created_at': row[4],
-                'expires_at': row[5],
-                'active': row[6],
-                'created_by': row[7],
-                'notes': row[8] if len(row) > 8 else ''
-            }
-            for row in c.fetchall()
+            {'key': r[1], 'max_accounts': r[2], 'days_valid': r[3], 'created_at': r[4],
+             'expires_at': r[5], 'active': r[6], 'created_by': r[7], 'notes': r[8] if len(r) > 8 else '',
+             'auto_responder_enabled': r[9] if len(r) > 9 else 0,
+             'max_auto_responders': r[10] if len(r) > 10 else 1}
+            for r in c.fetchall()
         ]
         
-        # Export users (WITH tokens)
         c.execute("SELECT * FROM users")
         backup_data['data']['users'] = [
-            {
-                'discord_id': row[1],
-                'license_key': row[2],
-                'discord_token': row[3],
-                'created_at': row[4],
-                'last_login': row[5]
-            }
-            for row in c.fetchall()
+            {'id': r[0], 'discord_id': r[1], 'license_key': r[2], 'discord_token': r[3],
+             'password_hash': r[4], 'created_at': r[5], 'last_login': r[6], 'max_accounts': r[7]}
+            for r in c.fetchall()
         ]
         
-        # Export jobs
         c.execute("SELECT * FROM jobs")
         backup_data['data']['jobs'] = [
-            {
-                'user_discord_id': row[1],
-                'job_name': row[2],
-                'channel_ids': row[3],
-                'message_content': row[4],
-                'interval_seconds': row[5],
-                'status': row[6],
-                'total_sent': row[7],
-                'created_at': row[8],
-                'last_run': row[9]
-            }
-            for row in c.fetchall()
+            {'user_id': r[1], 'job_name': r[2], 'channel_ids': r[3], 'message_content': r[4],
+             'interval_seconds': r[5], 'status': r[6], 'total_sent': r[7], 'created_at': r[8],
+             'last_run': r[9], 'token_used': r[10]}
+            for r in c.fetchall()
+        ]
+        
+        c.execute("SELECT * FROM auto_responders")
+        backup_data['data']['auto_responders'] = [
+            {'user_id': r[1], 'name': r[2], 'trigger_keyword': r[3], 'response_message': r[4],
+             'reply_to_new_dms': r[5], 'reply_to_mentions': r[6], 'cooldown_seconds': r[7],
+             'status': r[8], 'total_replies': r[9], 'created_at': r[10]}
+            for r in c.fetchall()
         ]
         
         conn.close()
-    
-    return backup_data
-
-def save_backup_to_file(filename=None):
-    """Save backup as a JSON file (and optionally zip it)"""
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    
-    if not filename:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"backup_{timestamp}"
-    
-    backup_data = export_full_backup()
-    
-    # Save JSON
-    json_path = os.path.join(BACKUP_DIR, f"{filename}.json")
-    with open(json_path, 'w') as f:
-        json.dump(backup_data, f, indent=2)
-    
-    # Create ZIP with manifest
-    zip_path = os.path.join(BACKUP_DIR, f"{filename}.zip")
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        manifest = {
-            'filename': f"{filename}.json",
-            'exported_at': backup_data['exported_at'],
-            'version': backup_data['version'],
-            'stats': {
-                'admins': len(backup_data['data']['admins']),
-                'licenses': len(backup_data['data']['licenses']),
-                'users': len(backup_data['data']['users']),
-                'jobs': len(backup_data['data']['jobs'])
-            }
-        }
-        zf.writestr('manifest.json', json.dumps(manifest, indent=2))
-        zf.write(json_path, arcname=f"{filename}.json")
-    
-    return {
-        'json_path': json_path,
-        'zip_path': zip_path,
-        'filename': filename,
-        'stats': {
-            'admins': len(backup_data['data']['admins']),
-            'licenses': len(backup_data['data']['licenses']),
-            'users': len(backup_data['data']['users']),
-            'jobs': len(backup_data['data']['jobs'])
-        },
-        'exported_at': backup_data['exported_at']
-    }
+        return backup_data
 
 def restore_from_backup(backup_data):
-    """Restore entire database from backup JSON data.
-    WARNING: This will REPLACE all current data.
-    """
     with DB_LOCK:
         conn = sqlite3.connect(DATABASE)
         c = conn.cursor()
         
-        # Clear all existing data
+        c.execute("DELETE FROM auto_responders")
         c.execute("DELETE FROM jobs")
         c.execute("DELETE FROM users")
         c.execute("DELETE FROM licenses")
-        c.execute("DELETE FROM admins")
         
-        # Restore admins
-        for admin in backup_data['data']['admins']:
-            c.execute("INSERT INTO admins (discord_id) VALUES (?)",
-                      (admin['discord_id'],))
-        
-        # Restore licenses
         for lic in backup_data['data']['licenses']:
             c.execute('''INSERT INTO licenses (key, max_accounts, days_valid, created_at, 
-                         expires_at, active, created_by, notes)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (lic['key'], lic['max_accounts'], lic['days_valid'],
-                       lic['created_at'], lic['expires_at'], lic['active'],
-                       lic['created_by'], lic.get('notes', '')))
+                         expires_at, active, created_by, notes, auto_responder_enabled, max_auto_responders)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (lic['key'], lic['max_accounts'], lic['days_valid'], lic['created_at'],
+                       lic['expires_at'], lic['active'], lic['created_by'], lic.get('notes', ''),
+                       lic.get('auto_responder_enabled', 0), lic.get('max_auto_responders', 1)))
         
-        # Restore users
         for user in backup_data['data']['users']:
-            c.execute('''INSERT INTO users (discord_id, license_key, discord_token, created_at, last_login)
-                         VALUES (?, ?, ?, ?, ?)''',
-                      (user['discord_id'], user['license_key'], user['discord_token'],
-                       user['created_at'], user['last_login']))
+            c.execute('''INSERT INTO users (id, discord_id, license_key, discord_token, 
+                         password_hash, created_at, last_login, max_accounts)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (user['id'], user['discord_id'], user['license_key'], user['discord_token'],
+                       user.get('password_hash'), user['created_at'], user['last_login'], user['max_accounts']))
         
-        # Restore jobs (set to stopped so they don't auto-start during restore)
         for job in backup_data['data']['jobs']:
-            c.execute('''INSERT INTO jobs (user_discord_id, job_name, channel_ids, message_content,
-                         interval_seconds, status, total_sent, created_at, last_run)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                      (job['user_discord_id'], job['job_name'], job['channel_ids'],
-                       job['message_content'], job['interval_seconds'], 'stopped',
-                       job['total_sent'], job['created_at'], job['last_run']))
+            c.execute('''INSERT INTO jobs (user_id, job_name, channel_ids, message_content,
+                         interval_seconds, status, total_sent, created_at, last_run, token_used)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (job['user_id'], job['job_name'], job['channel_ids'], job['message_content'],
+                       job['interval_seconds'], 'stopped', job['total_sent'], job['created_at'],
+                       job['last_run'], job.get('token_used')))
+        
+        for ar in backup_data['data']['auto_responders']:
+            c.execute('''INSERT INTO auto_responders (user_id, name, trigger_keyword, response_message,
+                         reply_to_new_dms, reply_to_mentions, cooldown_seconds, status, total_replies, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                      (ar['user_id'], ar['name'], ar['trigger_keyword'], ar['response_message'],
+                       ar['reply_to_new_dms'], ar['reply_to_mentions'], ar['cooldown_seconds'],
+                       ar['status'], ar['total_replies'], ar['created_at']))
         
         conn.commit()
         conn.close()
-    
-    return {
-        'admins_restored': len(backup_data['data']['admins']),
-        'licenses_restored': len(backup_data['data']['licenses']),
-        'users_restored': len(backup_data['data']['users']),
-        'jobs_restored': len(backup_data['data']['jobs'])
-    }
-
-def list_backups():
-    """List all available backup files"""
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    backups = []
-    
-    for f in os.listdir(BACKUP_DIR):
-        if f.endswith('.json'):
-            path = os.path.join(BACKUP_DIR, f)
-            try:
-                with open(path) as fh:
-                    data = json.load(fh)
-                backups.append({
-                    'filename': f,
-                    'exported_at': data.get('exported_at', 'unknown'),
-                    'stats': {
-                        'admins': len(data['data']['admins']),
-                        'licenses': len(data['data']['licenses']),
-                        'users': len(data['data']['users']),
-                        'jobs': len(data['data']['jobs'])
-                    },
-                    'size': os.path.getsize(path)
-                })
-            except:
-                backups.append({
-                    'filename': f,
-                    'exported_at': 'corrupt/invalid',
-                    'stats': None,
-                    'size': os.path.getsize(path)
-                })
-    
-    return sorted(backups, key=lambda x: x['filename'], reverse=True)
-
-def load_backup_from_file(filename):
-    """Load a backup JSON file and return the data"""
-    path = os.path.join(BACKUP_DIR, filename)
-    if not os.path.exists(path):
-        path2 = os.path.join(BACKUP_DIR, f"{filename}.json")
-        if os.path.exists(path2):
-            path = path2
-        else:
-            # Try without extension
-            for f in os.listdir(BACKUP_DIR):
-                if f.startswith(filename) and f.endswith('.json'):
-                    path = os.path.join(BACKUP_DIR, f)
-                    break
-            else:
-                return None
-    
-    with open(path) as f:
-        return json.load(f)
-
-def auto_backup():
-    """Create an automatic timestamped backup (called periodically)"""
-    result = save_backup_to_file()
-    # Keep only last 10 auto-backups to save space
-    backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith('.json') and f.startswith('backup_')])
-    while len(backups) > 10:
-        os.remove(os.path.join(BACKUP_DIR, backups.pop(0)))
-    return result
+        return {'success': True}
